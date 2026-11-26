@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="grid">
+  <div>
+    <div class="card">
+      <h2>开始一次构建演练</h2>
+      {% if active %}
+      <div class="badge b-run" style="margin-bottom:14px">
+        <span class="live-dot" style="vertical-align:middle"></span>
+        已有 -j{{ active.jobs }} 构建正在运行…
+      </div>
+      <a class="btn" style="width:100%;text-align:center;padding:12px"
+         href="/runs/{{ active.id }}">查看进行中的构建 →</a>
+      {% else %}
+      <form method="post" action="/build" id="buildForm">
+        <label class="opt" data-j="2">
+          <input type="radio" name="jobs" value="2" checked>
+          <span>
+            <span class="big jtag">-j2</span>
+            <span class="desc" style="display:block">2 个名额：两个批各用 1 个隐式名额即可占满，
+              管道里没有空闲令牌，批内基本串行；全局 GCC 峰值应为 2。</span>
+          </span>
+        </label>
+        <label class="opt" data-j="4">
+          <input type="radio" name="jobs" value="4">
+          <span>
+            <span class="big jtag">-j4</span>
+            <span class="desc" style="display:block">4 个名额：两个批 + 普通 GCC 目标先占 3 个，
+              剩余 1 个令牌被某个批借走；后续目标完成释放名额后，批还会继续借令牌并行，
+              全局 GCC 峰值应为 4。</span>
+          </span>
+        </label>
+        <label class="checkline">
+          <input type="checkbox" name="fail" value="1" id="failChk">
+          <span>注入样例编译失败（给 modbus_channel_03.c 传
+            <code>-DDRILL_INJECT_FAILURE=1</code>，触发真实 <code>#error</code>）</span>
+        </label>
+        <button class="primary" type="submit">开始构建</button>
+      </form>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>接入原理（Make 4.3 的关键细节）</h2>
+      <div class="principle">
+        ① Make 4.3 把 <code>--jobserver-auth=3,4</code> 放进 <code>MAKEFLAGS</code>，
+        但管道 fd 默认带 <code>O_CLOEXEC</code>，只对标了 <code>+</code> 的“递归”配方行放开继承。
+        所以两个批目标的配方都以 <code>+</code> 开头。<br>
+        ② 每条配方自带 <b>1 个隐式名额</b>：管道空了，batchcc 也能先开 1 个 GCC。<br>
+        ③ 批内还有文件时，每多开 1 个 GCC 就从 fd3 <b>非阻塞读 1 字节令牌</b>。<br>
+        ④ GCC 退出并 <code>waitpid</code> 回收后，才把<b>同一个字节</b>写回 fd4；
+        编译失败 / 收信号也照还。隐式名额不写回。<br>
+        ⑤ 全机构 GCC 数因此恒 ≤ 所选 <code>-j</code>；make 收尾会校验令牌总数，
+        泄漏或多还都会打出 <code>INTERNAL</code> 错误。
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="padding:0;overflow:hidden">
+    <div style="padding:18px 22px 6px"><h2 style="margin:0">演练记录</h2></div>
+    {% if runs %}
+    <table>
+      <thead>
+        <tr>
+          <th>开始时间</th><th>档位</th><th>失败注入</th><th>结果</th>
+          <th>GCC 峰值 / 上限</th><th>令牌核算</th><th>耗时</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in runs %}
+        <tr>
+          <td class="mono" style="white-space:nowrap">{{ r.started_iso or r.id }}</td>
+          <td class="jtag">-j{{ r.jobs }}</td>
+          <td>{% if r.fail %}<span class="badge b-warn">是</span>{% else %}<span class="muted">否</span>{% endif %}</td>
+          <td>
+            {% if r.status != 'done' %}
+              <span class="badge b-run"><span class="live-dot"></span>{{ r.status }}</span>
+            {% elif r.verdict == 'success' %}
+              <span class="badge b-ok">构建成功</span>
+            {% elif r.verdict == 'injected_failure_ok' %}
+              <span class="badge b-warn">如期失败 · 名额已还</span>
+            {% elif r.verdict == 'cap_violation' %}
+              <span class="badge b-bad">GCC 超过 -j!</span>
+            {% elif r.verdict == 'token_error' %}
+              <span class="badge b-bad">令牌核算错误</span>
+            {% else %}
+              <span class="badge b-bad">{{ r.verdict or '失败' }}</span>
+            {% endif %}
+          </td>
+          <td style="font-variant-numeric:tabular-nums">
+            {% if r.peak_gcc is defined %}
+              <b class="{% if r.cap_violated %}muted{% endif %}"
+                 style="color:{% if r.cap_violated %}var(--bad){% else %}var(--ok){% endif %}">
+                {{ r.peak_gcc }}</b> / {{ r.jobs }}
+            {% else %}<span class="muted">—</span>{% endif %}
+          </td>
+          <td>
+            {% if r.token_sanity_ok is defined %}
+              {% if r.token_sanity_ok and r.borrow_return_ok %}
+                <span class="badge b-ok">平</span>
+              {% else %}
+                <span class="badge b-bad">异常</span>
+              {% endif %}
+            {% else %}<span class="muted">—</span>{% endif %}
+          </td>
+          <td class="mono">{% if r.duration_s is defined %}{{ r.duration_s }}s{% else %}—{% endif %}</td>
+          <td><a class="btn" href="/runs/{{ r.id }}">详情 / 日志</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <div class="empty">还没有演练记录，点左侧“开始构建”试一发。</div>
+    {% endif %}
+  </div>
+</div>
+
+<script>
+  // 选中的 -j 卡片高亮
+  document.querySelectorAll('label.opt').forEach(function(lab){
+    var radio = lab.querySelector('input[type=radio]');
+    function sync(){ lab.classList.toggle('sel', radio.checked); }
+    radio.addEventListener('change', function(){
+      document.querySelectorAll('label.opt').forEach(function(l){ l.classList.remove('sel'); });
+      sync();
+    });
+    sync();
+  });
+</script>
+{% endblock %}

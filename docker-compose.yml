@@ -1,0 +1,18 @@
+services:
+  batchcc-drill:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: batchcc-jobserver-drill:latest
+    container_name: batchcc-jobserver-drill
+    # init 负责回收僵尸进程；我们的构建子进程本身都已正确 waitpid。
+    init: true
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+      DRILL_RUNS_DIR: /workspace/runs
+    volumes:
+      # 构建日志 / meta / JSONL 落到宿主机，方便“查看构建日志”和事后核对。
+      - ./runs:/workspace/runs
+    restart: "no"

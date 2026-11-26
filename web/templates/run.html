@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% block title %}演练 {{ run.id }}{% endblock %}
+{% block content %}
+<div class="toolbar">
+  <a class="btn" href="/">← 列表</a>
+  <a class="btn" href="/runs/{{ run.id }}/log" target="_blank">查看原始构建日志 ↗</a>
+  <span style="flex:1"></span>
+  <span class="muted mono" style="font-size:12.5px">{{ run.id }}</span>
+</div>
+
+<div style="display:flex;align-items:center;gap:14px;margin:6px 0 18px;flex-wrap:wrap">
+  <h2 style="margin:0;font-size:20px">
+    <span class="jtag">make -j{{ run.jobs }}</span>
+    {% if run.fail %}<span class="badge b-warn" style="margin-left:8px">失败注入 ON</span>{% endif %}
+  </h2>
+  <span id="statusBadge"></span>
+</div>
+
+<div class="metrics" id="metrics"></div>
+
+<div class="card">
+  <h2>全机构 GCC 并发采样（/proc，20ms 一次）</h2>
+  <svg id="spark" class="spark" preserveAspectRatio="none"></svg>
+  <div class="hint" id="sparkHint"></div>
+  <div class="hint mono" id="peakDetail" style="margin-top:6px"></div>
+</div>
+
+<div class="card">
+  <h2>两个批目标的令牌账（batchcc JSONL 汇总）</h2>
+  <div id="summaries"><span class="muted">构建结束后展示…</span></div>
+  <div id="tokenErrors" style="margin-top:12px"></div>
+</div>
+
+<div class="card">
+  <h2>构建日志 <span class="hint" style="font-weight:400">（含每次借令牌 / GCC 起止 / 原样归还）</span></h2>
+  <div class="toolbar">
+    <label class="checkline" style="margin:0"><input type="checkbox" id="follow" checked> 自动滚动到底部</label>
+    <button class="btn" type="button" id="refreshLog">刷新日志</button>
+  </div>
+  <pre class="log" id="log">加载中…</pre>
+</div>
+
+<script>
+const RUN_ID = {{ run.id|tojson }};
+const INITIAL = {{ run|tojson }};
+let active = {{ 'true' if is_active else 'false' }};
+let timer = null;
+
+function el(html){ const t=document.createElement('template'); t.innerHTML=html.trim(); return t.content.firstElementChild; }
+
+function verdictBadge(m){
+  if (m.status !== 'done') return '<span class="badge b-run"><span class="live-dot"></span>构建中…</span>';
+  const map = {
+    success: ['b-ok','构建成功，令牌账平'],
+    injected_failure_ok: ['b-warn','已触发编译失败 · 令牌如数归还'],
+    cap_violation: ['b-bad','GCC 并发超过 -j（违约）'],
+    token_error: ['b-bad','make 令牌核算错误（泄漏/多还）'],
+    unexpected_failure: ['b-bad','非预期构建失败'],
+    server_error: ['b-bad','服务端执行异常'],
+    interrupted_by_server_restart: ['b-muted','因服务重启中断']
+  };
+  const [cls,txt] = map[m.verdict] || ['b-bad', m.verdict || '已结束'];
+  return `<span class="badge ${cls}">${txt}</span>`;
+}
+
+function renderMetrics(m){
+  const peak = (m.peak_gcc===undefined) ? '—' : m.peak_gcc;
+  const capCls = m.cap_violated ? 'bad' : (m.peak_gcc!==undefined ? 'good' : '');
+  const tokenTxt = m.token_sanity_ok===undefined ? '—'
+      : (m.token_sanity_ok && m.borrow_return_ok ? '平 ✓' : '异常 ✗');
+  const tokenCls = (m.token_sanity_ok===false || m.borrow_return_ok===false) ? 'bad'
+      : (m.token_sanity_ok!==undefined ? 'good' : '');
+  const dur = m.duration_s===undefined ? '…' : m.duration_s + 's';
+  const rc = m.exit_code===null || m.exit_code===undefined ? '…' : m.exit_code;
+  document.getElementById('metrics').innerHTML = `
+    <div class="metric"><div class="k">make 退出码</div><div class="v">${rc}</div></div>
+    <div class="metric"><div class="k">构建耗时</div><div class="v" style="font-size:22px">${dur}</div></div>
+    <div class="metric ${capCls}"><div class="k">GCC 峰值 / 上限 -j${m.jobs}</div>
+      <div class="v">${peak}<small> / ${m.jobs}</small></div></div>
+    <div class="metric ${tokenCls}"><div class="k">jobserver 令牌核算</div>
+      <div class="v" style="font-size:22px">${tokenTxt}</div></div>`;
+  document.getElementById('statusBadge').innerHTML = verdictBadge(m);
+}
+
+function renderSpark(m){
+  const svg = document.getElementById('spark');
+  const s = m.series || [];
+  const W = 1000, H = 150, pad = 26;
+  if (s.length < 2){
+    svg.innerHTML = `<text x="20" y="80" fill="#94a3b8" font-size="14">等待采样数据…</text>`;
+    document.getElementById('sparkHint').textContent = '';
+    return;
+  }
+  const tmax = Math.max(1, s[s.length-1][0]);
+  const jmax = Math.max(m.jobs, ...s.map(p=>p[1]));
+  const ymax = Math.max(jmax+0.6, 2);
+  const X = t => pad + (t/tmax)*(W-pad*1.4);
+  const Y = n => H-pad - (n/ymax)*(H-pad*1.7);
+  let path = s.map((p,i)=>(i?'L':'M')+X(p[0]).toFixed(1)+' '+Y(p[1]).toFixed(1)).join(' ');
+  let dots = '';
+  for (let k=0;k<=jmax;k++){
+    dots += `<line x1="${pad}" x2="${W-8}" y1="${Y(k)}" y2="${Y(k)}" stroke="#e2e8f0"/>`;
+    dots += `<text x="8" y="${Y(k)+4}" font-size="11" fill="#94a3b8">${k}</text>`;
+  }
+  // -j 上限红线
+  const yj = Y(m.jobs);
+  let html = `<rect x="0" y="0" width="${W}" height="${H}" fill="#fff"/>${dots}`;
+  html += `<line x1="${pad}" x2="${W-8}" y1="${yj}" y2="${yj}" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="6 4"/>
+           <text x="${W-150}" y="${yj-6}" font-size="12" fill="#dc2626">上限 -j${m.jobs}（不得越过）</text>`;
+  html += `<path d="${path}" fill="none" stroke="#2563eb" stroke-width="2"/>`;
+  if (m.peak_gcc!==undefined){
+    html += `<text x="${pad}" y="16" font-size="12.5" fill="#1d4ed8">峰值 ${m.peak_gcc} 个 GCC 同时运行 @ ${m.peak_at_ms} ms</text>`;
+  }
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.innerHTML = html;
+  document.getElementById('sparkHint').textContent =
+    `横轴 ms（总时长 ${tmax}ms）；曲线为每 20ms 扫描 /proc 得到的 GCC 驱动进程数（仅本次 make 子树、排除僵尸态）。`;
+  const pd = m.peak_detail || [];
+  document.getElementById('peakDetail').textContent = pd.length
+    ? '峰值现场: ' + pd.map(d => `pid ${d.pid}(ppid ${d.ppid}) ${d.exe.split('/').pop()}`).join(' ｜ ')
+    : '';
+}
+
+function renderSummaries(m){
+  const box = document.getElementById('summaries');
+  const sums = m.summaries || [];
+  if (!sums.length){ box.innerHTML = '<span class="muted">暂无 batchcc summary（构建仍在进行？）</span>'; return; }
+  let rows = sums.map(s=>`<tr>
+      <td class="mono"><b>${s.group}</b></td>
+      <td><b>${s.peak_concurrency}</b></td>
+      <td>${s.succeeded}</td><td>${s.failed}</td><td>${s.abandoned}</td>
+      <td>${s.borrowed_tokens}</td>
+      <td>${s.returned_tokens}</td>
+      <td>${s.borrowed_tokens===s.returned_tokens ? '<span class="badge b-ok">相等</span>' : '<span class="badge b-bad">不等</span>'}</td>
+    </tr>`).join('');
+  box.innerHTML = `<table><thead><tr>
+      <th>批/组</th><th>批内 GCC 峰值</th><th>成功</th><th>失败</th><th>未开工</th>
+      <th>借令牌</th><th>已归还</th><th>借还</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const te = document.getElementById('tokenErrors');
+  if ((m.token_errors||[]).length){
+    te.innerHTML = `<div class="badge b-bad">make 令牌核算异常</div>
+      <pre class="log" style="margin-top:8px;max-height:160px">${(m.token_errors||[]).join('\n')}</pre>`;
+  } else if (m.status==='done'){
+    te.innerHTML = `<span class="badge b-ok">make 收尾未报告 INTERNAL 令牌错误：全机构 ${m.jobs-1} 个管道令牌 + 1 个隐式名额账实相符</span>`;
+  }
+}
+
+let logText = '';
+async function refreshLog(){
+  try{
+    const resp = await fetch(`/runs/${RUN_ID}/log?t=${Date.now()}`);
+    logText = await resp.text();
+    const pre = document.getElementById('log');
+    const follow = document.getElementById('follow').checked;
+    const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 60;
+    pre.textContent = logText;
+    if (follow || atBottom) pre.scrollTop = pre.scrollHeight;
+  }catch(e){ /* 轮询瞬时失败忽略 */ }
+}
+
+function renderAll(m){
+  renderMetrics(m); renderSpark(m); renderSummaries(m);
+}
+
+async function poll(){
+  try{
+    const resp = await fetch(`/api/runs/${RUN_ID}`);
+    const m = await resp.json();
+    active = !!m.is_active;
+    renderAll(m);
+    await refreshLog();
+    if (!active){ clearInterval(timer); }
+  }catch(e){ /* keep polling */ }
+}
+
+renderAll(INITIAL);
+refreshLog();
+if (active){ timer = setInterval(poll, 1000); }
+document.getElementById('refreshLog').addEventListener('click', refreshLog);
+</script>
+{% endblock %}
